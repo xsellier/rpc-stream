@@ -41,7 +41,7 @@ test('tcp', function (t) {
     a.pipe(sock).pipe(a)
   }).listen(port, function () {
     b.pipe(net.connect(port)).pipe(b)
-    
+
     b.wrap('hello').hello('SILLY', function (err, mes) {
       t.equal(mes, 'HI, SILLY')
       a.end()
@@ -61,7 +61,7 @@ test('child_process', function(t) {
   var b = rpc()
 
   b.pipe(es.duplex(cp.stdin, cp.stdout)).pipe(b)
-  
+
   cp.stderr.pipe(process.stderr, {end: false})
   b.wrap('hello').hello('WHO?', function (err, mes) {
     t.error(err)

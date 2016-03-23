@@ -1,127 +1,167 @@
-var through = require('through')
-var serialize = require('stream-serializer')()
+'use strict'
 
-function get(obj, path) {
-  if(Array.isArray(path)) {
-    for(var i in path)
-      obj = obj[path[i]]
-    return obj
+const through = require('through')
+const serialize = require('stream-serializer')()
+
+const MISSING_CALLBACK = -1
+
+const expandError = function(err) {
+  if (err && err.message) {
+    err = Object.assign(new Error(err.message), err)
   }
-  return obj[path]
+
+  return err
 }
 
-module.exports = function (obj, opts) {
-  if('boolean' == typeof opts) opts = { raw: opts }
-  opts = opts || {}
-  var cbs = {}, count = 1, local = obj || {}
-  var flattenError = opts.flattenError || function (err) {
-    if(!(err instanceof Error)) return err
-    var err2 = { message: err.message }
-    for(var k in err)
-      err2[k] = err[k] 
-    return err2
+const callable = function(obj, key) {
+  return function(args, callback) {
+    return obj[key].apply(obj, callback ? args.concat(callback) : args)
   }
-  function expandError(err) {
-    if (!err || !err.message) return err
-    var err2 = new Error(err.message)
-    for(var k in err)
-      err2[k] = err[k]
-    return err2
+}
+
+module.exports = function(obj, opts) {
+  if (/(true|false)/i.test(opts)) {
+    opts = { raw: opts }
+  } else {
+    opts = opts || {}
   }
 
-  if(obj) {
-    local = {}
-    function callable (k) {
-      return function (args, cb) {
-        return obj[k].apply(obj, cb ? args.concat(cb) : args)
-      }
+  let callbackList = {}
+  let currentCallbackIndex = 1
+  let local = obj || {}
+
+  let flattenError = opts.flattenError || function(err) {
+    if (err instanceof Error) {
+      // format error
+      err = Object.assign({ message: err.message }, err)
     }
-    for(var k in obj)
-      local[k] = callable(k)
 
+    return err
   }
-  var s = through(function (data) {
-    //write - on incoming call 
+
+  if (obj) {
+    local = {}
+
+    Object.keys(obj).forEach((key) => {
+      local[key] = callable(obj, key)
+    })
+  }
+
+  const stream = through(function(data) {
+    // write - on incoming call
     data = data.slice()
-    var i = data.pop(), args = data.pop(), name = data.pop()
-    //if(~i) then there was no callback.    
 
-    if (args[0]) args[0] = expandError(args[0])
+    let callbackIndex = data.pop()
+    let args = data.pop(), name = data.pop()
 
-    if(name != null) {
-      var called = 0
-      var cb = function () {
-        if (called++) return
-        var args = [].slice.call(arguments)
+    // if(~callbackIndex) then there was no callback.
+    if (args[0]) {
+      args[0] = expandError(args[0])
+    }
+
+    if (name != null) {
+      let called = false
+      const callback = function() {
+        if (called) {
+          return
+        }
+
+        called = true
+
+        let args = [].slice.call(arguments)
+
         args[0] = flattenError(args[0])
-        if(~i) s.emit('data', [args, i]) //responses don't have a name.
-      }
-      try {
-        local[name].call(obj, args, cb)
-      } catch (err) {
-        if(~i) s.emit('data', [[flattenError(err)], i])
-      }
-    } else if(!cbs[i]) {
-      //there is no callback with that id.
-      //either one end mixed up the id or
-      //it was called twice.
-      //log this error, but don't throw.
-      //this process shouldn't crash because another did wrong
 
-      s.emit('invalid callback id')
-      return console.error('ERROR: unknown callback id: '+i, data)
+        // responses don't have a name.
+        if (~callbackIndex) {
+          stream.emit('data', [args, callbackIndex])
+        }
+      }
+
+      try {
+        local[name].call(obj, args, callback)
+      } catch (err) {
+        if (~callbackIndex) {
+          stream.emit('data', [[flattenError(err)], callbackIndex])
+        }
+      }
+    } else if (!callbackList[callbackIndex]) {
+      // there is no callback with that id.
+      // either one end mixed up the id or
+      // it was called twice.
+      // log this error, but don't throw.
+      // this process shouldn't crash because another did wrong
+      let invalidCallbackIdErr = new Error(`Invalid callback id (${id}, ${data})`)
+
+      stream.emit('error', invalidCallbackIdErr)
+
+      return invalidCallbackIdErr
     } else {
-      //call the callback.
-      var cb = cbs[i]
-      delete cbs[i] //delete cb before calling it, incase cb throws.
-      cb.apply(null, args)
+      // call the callback.
+      let callback = callbackList[callbackIndex]
+
+      // delete callback before calling it, incase callback throws.
+      delete callbackList[callbackIndex]
+
+      callback.apply(null, args)
     }
   })
 
-  var rpc = s.rpc = function (name, args, cb) {
-    if(cb) cbs[++count] = cb
-    if('string' !== typeof name)
-      throw new Error('name *must* be string')
-    s.emit('data', [name, args, cb ? count : -1])
-    if(cb && count == 9007199254740992) count = 0 //reset if max
-    //that is 900 million million.
-    //if you reach that, dm me,
-    //i'll buy you a beer. @dominictarr
+  const rpc = stream.rpc = function(name, args, callback) {
+    if (callback) {
+      callbackList[++currentCallbackIndex] = callback
+    }
+
+    if ('string' !== typeof name) {
+      throw new Error(`'name' *must* be string, ${name}`)
+    }
+
+    stream.emit('data', [name, args, callback ? currentCallbackIndex : MISSING_CALLBACK])
+
+    if (callback && currentCallbackIndex >= Number.MAX_SAFE_INTEGER) {
+      // reset if max
+      currentCallbackIndex = 0
+    }
+
+    // that is 900 million million.
+    // if you reach that, dm me,
+    // callbackIndex'll buy you a beer. @dominictarr
   }
 
-  function keys (obj) {
-    var keys = []
-    for(var k in obj) keys.push(k)
-    return keys
-  }
-
-  s.createRemoteCall = function (name) {
-    return function () {
+  stream.createRemoteCall = function(name) {
+    return function() {
       var args = [].slice.call(arguments)
-      var cb = ('function' == typeof args[args.length - 1])
-               ? args.pop()
-               : null
-      rpc(name, args, cb)
+      var callback = ('function' === typeof args[args.length - 1]) ? args.pop() : null
+
+      rpc(name, args, callback)
     }
   }
 
-  s.createLocalCall = function (name, fn) {
-     local[name] = fn
+  stream.createLocalCall = function(name, fn) {
+    local[name] = fn
   }
 
-  s.wrap = function (remote, _path) {
-    _path = _path || []
-    var w = {}
-    ;(Array.isArray(remote)     ? remote
-    : 'string' == typeof remote ? [remote]
-    : remote = keys(remote)
-    ).forEach(function (k) {
-      w[k] = s.createRemoteCall(k)
+  stream.wrap = function(remote) {
+    let wrappedFunctions = {}
+
+    if (!Array.isArray(remote)) {
+      if ('string' === typeof remote) {
+        remote = [remote]
+      } else {
+        remote = Object.keys(remote)
+      }
+    }
+
+    remote.forEach(function(key) {
+      wrappedFunctions[key] = stream.createRemoteCall(key)
     })
-    return w
-  }
-  if(opts.raw)
-    return s
 
-  return serialize(s)
+    return wrappedFunctions
+  }
+
+  if (opts.raw) {
+    return stream
+  }
+
+  return serialize(stream)
 }
